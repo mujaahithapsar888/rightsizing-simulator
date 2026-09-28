@@ -6,7 +6,7 @@ from typing import AsyncGenerator
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
-from app.api.v1 import auth, event_recovery, experiments, feedback, metrics, predictor as model_predictor, reports, simulator
+from app.api.v1 import auth, event_recovery, experiments, feedback, metrics, predictor as model_predictor, reports, simulator, telemetry
 from app.core.config import settings
 from app.core.database import engine, Base
 from app.core.security import create_admin_user
@@ -57,6 +57,7 @@ app.include_router(event_recovery.router, prefix=f"{PREFIX}/event-recovery", tag
 app.include_router(experiments.router, prefix=f"{PREFIX}/experiments", tags=["Experiments"])
 app.include_router(reports.router, prefix=f"{PREFIX}/reports", tags=["Reports"])
 app.include_router(feedback.router, prefix=f"{PREFIX}/feedback", tags=["Stakeholder Feedback"])
+app.include_router(telemetry.router, prefix=f"{PREFIX}/telemetry", tags=["Telemetry Stream"])
 
 
 @app.get("/health", tags=["Health"])

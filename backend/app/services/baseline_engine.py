@@ -91,19 +91,26 @@ def run_baseline_analysis(
             cand_avail = float(np.mean(pred_avails))
             model_driven = True
         else:
-            # Fallback scaling
+            # Mathematical Queuing-Theory scaling for Baseline Rightsizing
             cpu_scale = spec["vcpu"] / config.current_vcpu if config.current_vcpu > 0 else 1.0
             mem_scale = spec["memory_gb"] / config.current_memory_gb if config.current_memory_gb > 0 else 1.0
             
             cand_cpu = min(100.0, avg_cpu / cpu_scale) if cpu_scale > 0 else avg_cpu
             cand_mem = min(100.0, avg_mem / mem_scale) if mem_scale > 0 else avg_mem
-            cand_lat = avg_lat * (1.0 + max(0.0, (cand_cpu - avg_cpu) / 100.0))
             
-            # Simple fallback availability penalty
-            if cand_cpu > 80.0 or cand_mem > 85.0:
-                cand_avail = 99.5
-            else:
-                cand_avail = avg_avail
+            # Non-linear latency scaling using a queuing theory approximation:
+            # Latency exponentially increases as CPU utilization approaches 100%
+            util_fraction = min(0.99, cand_cpu / 100.0)
+            base_processing_time = avg_lat * 0.5  # Assume half of latency is fixed
+            queue_wait_time = base_processing_time * (util_fraction / (1.0 - util_fraction))
+            cand_lat = base_processing_time + queue_wait_time
+            
+            # Non-linear availability degradation (SLA Risk)
+            # Starts degrading rapidly once CPU or Mem cross 80% threshold
+            cpu_penalty = max(0.0, (cand_cpu - 80.0) ** 2 / 100.0)
+            mem_penalty = max(0.0, (cand_mem - 85.0) ** 2 / 100.0)
+            cand_avail = max(90.0, avg_avail - cpu_penalty - mem_penalty)
+            
             model_driven = False
 
         # Constraint check
