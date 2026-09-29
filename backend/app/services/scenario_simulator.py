@@ -64,19 +64,40 @@ def simulate_scenario(
     latency_series: Optional[List[float]] = None,
     availability_series: Optional[List[float]] = None,
 ) -> Dict[str, Any]:
-    """Runs a target simulation scenario with adjustments."""
+    """
+    Executes a scenario-based simulation and sensitivity analysis.
+
+    Simulates the operational impact of migrating current cloud nodes to target instance
+    candidates under specific stress scenarios (Normal Weekday, Live Sports Surge, Viral Video Spike).
+
+    Args:
+        scenario_key: The scenario profile identifier ("normal_weekday", "live_sports", "viral_video").
+        config: Base simulation configuration including current instance specs and time window.
+        user_adjustments: User-tuned operational parameters including traffic growth factor,
+                          CPU/memory safety thresholds, latency SLAs, and availability targets.
+        cpu_series: Optional historical CPU utilization vector [0.0 - 100.0].
+        memory_series: Optional historical memory utilization vector [0.0 - 100.0].
+        latency_series: Optional historical latency vector (ms).
+        availability_series: Optional historical uptime percentage vector.
+
+    Returns:
+        Structured dictionary containing candidate metrics, recommended sizing, cost savings,
+        and sensitivity analysis tracking how recommendations shift under +/- 20% load perturbations.
+    """
     scenario = SCENARIOS.get(scenario_key, SCENARIOS["normal_weekday"])
     
-    # 1. Adjust Base Telemetry Metrics based on Scenario
+    # ── Step 1: Calculate Total Workload Multiplier ────────────────────────────
+    # Combines baseline scenario surge factor (e.g. 2.5x for live sports) with user-defined growth
     traffic_growth = user_adjustments.get("traffic_growth", 1.0)
     total_multiplier = scenario["traffic_multiplier"] * traffic_growth
 
-    # Build or scale arrays
+    # ── Step 2: Ingest or Synthesize Workload Telemetry Arrays ────────────────
     cpu_arr = np.array(cpu_series) if cpu_series else np.array([])
     mem_arr = np.array(memory_series) if memory_series else np.array([])
     lat_arr = np.array(latency_series) if latency_series else np.array([])
     avail_arr = np.array(availability_series) if availability_series else np.array([])
 
+    # If historical telemetry is not passed, generate reproducible Gaussian synthetic telemetry
     if len(cpu_arr) == 0:
         rng = np.random.default_rng(42)
         hours = config.time_window_hours
@@ -85,12 +106,13 @@ def simulate_scenario(
         lat_arr = np.clip(rng.normal(loc=scenario["base_latency_loc"], scale=25, size=hours), 50, 500)
         avail_arr = np.clip(rng.normal(loc=scenario["base_availability_loc"], scale=0.03, size=hours), 99.0, 100.0)
 
-    # Scale base metrics by scenario multiplier
+    # ── Step 3: Scale Metrics by Scenario Traffic Multipliers ────────────────
+    # CPU scales directly with request volume; Memory scaling is dampened (0.6 elasticity factor)
     cpu_scaled = np.clip(cpu_arr * total_multiplier, 0.0, 100.0)
     mem_scaled = np.clip(mem_arr * (1.0 + (total_multiplier - 1.0) * 0.6), 0.0, 100.0)
     lat_scaled = lat_arr * (1.0 + (total_multiplier - 1.0) * 0.8)
     
-    # Simple availability degradation
+    # Availability penalty: heavy load surges introduce minor packet queuing degradation
     avail_penalty = max(0.0, (total_multiplier - 1.0) * 0.05)
     avail_scaled = np.clip(avail_arr - avail_penalty, 90.0, 100.0)
 
@@ -99,7 +121,7 @@ def simulate_scenario(
     avg_lat = float(np.mean(lat_scaled))
     avg_avail = float(np.mean(avail_scaled))
 
-    # Limits/Targets
+    # ── Step 4: Extract Operator Constraints & SLA Thresholds ────────────────
     cpu_limit = user_adjustments.get("cpu_threshold", 80.0)
     mem_limit = user_adjustments.get("memory_threshold", 85.0)
     lat_limit = user_adjustments.get("latency_target", 250.0)
@@ -109,23 +131,30 @@ def simulate_scenario(
 
     candidates_metrics = []
     
+    # ── Step 5: Evaluate All Hardware Instance Candidates in Catalog ─────────
     for name, spec in INSTANCE_SPECS.items():
         cost_per_hour = pricing_override.get(name, spec["cost_per_hour"])
+        # Compute monthly cost based on a standard 720-hour cloud billing cycle (24 * 30)
         monthly_cost = cost_per_hour * config.instance_count * 24 * 30
 
-        # Simple analytical scaling projection
+        # Hardware scaling factors: ratio of candidate capacity to current cluster baseline
         cpu_scale = spec["vcpu"] / config.current_vcpu if config.current_vcpu > 0 else 1.0
         mem_scale = spec["memory_gb"] / config.current_memory_gb if config.current_memory_gb > 0 else 1.0
 
+        # Projected resource utilization under candidate specifications
         cand_cpu = min(100.0, avg_cpu / cpu_scale) if cpu_scale > 0 else avg_cpu
         cand_mem = min(100.0, avg_mem / mem_scale) if mem_scale > 0 else avg_mem
+        
+        # Latency model: saturation above baseline causes queuing delay amplification
         cand_lat = avg_lat * (1.0 + max(0.0, (cand_cpu - avg_cpu) / 100.0))
         
+        # Availability model: severe saturation (>80% CPU or >85% RAM) risks thread starvation
         if cand_cpu > 80.0 or cand_mem > 85.0:
             cand_avail = max(90.0, avg_avail - 1.0)
         else:
             cand_avail = avg_avail
 
+        # Boolean constraint checks against operator SLAs
         passes_latency = cand_lat <= lat_limit
         passes_avail = cand_avail >= avail_limit
         passes_cpu = cand_cpu <= cpu_limit
@@ -166,9 +195,13 @@ def simulate_scenario(
     current_candidate = next((c for c in candidates_metrics if c["instance_type"] == config.current_instance_type), candidates_metrics[-1])
     savings = current_candidate["monthly_cost"] - recommended_candidate["monthly_cost"]
 
-    # Sensitivity Analysis
+    # ── Step 6: Sensitivity Analysis & Parameter Bottleneck Tracking ──────────
+    # Tests how robust the recommendation is by perturbing 4 critical operational levers:
+    # 1. Traffic surge (+20% volume growth)
+    # 2. Stringent CPU policy (lowered to 65% ceiling)
+    # 3. Aggressive latency SLA (tightened to 180 ms)
+    # 4. Strict uptime SLA (raised to 99.95% availability)
     sensitivity = []
-    # Test changes to Traffic Growth, CPU Limit, Latency Target, Availability Target
     tests = [
         {"param": "Traffic Surge (+20%)", "adjustments": {**user_adjustments, "traffic_growth": traffic_growth * 1.2}},
         {"param": "Strict CPU Limit (65%)", "adjustments": {**user_adjustments, "cpu_threshold": 65.0}},
@@ -177,11 +210,11 @@ def simulate_scenario(
     ]
 
     for test in tests:
-        # Re-run simulation logic for the specific test
+        # Re-evaluate all candidate topologies against perturbed parameter space
         test_valid = []
         for cand in candidates_metrics:
             spec = INSTANCE_SPECS[cand["instance_type"]]
-            # Re-scale parameters
+            # Re-scale parameters for the perturbation test
             test_traffic_mult = scenario["traffic_multiplier"] * test["adjustments"].get("traffic_growth", 1.0)
             t_cpu = min(100.0, float(np.mean(cpu_arr * test_traffic_mult)) / cpu_scale)
             t_mem = min(100.0, float(np.mean(mem_arr * (1.0 + (test_traffic_mult - 1.0) * 0.6))) / mem_scale)
@@ -199,6 +232,7 @@ def simulate_scenario(
         test_rec = recommended_candidate["instance_type"]
         trigger_reason = "No Change"
         
+        # If perturbation invalidates all downsizing options, fall back to current cluster baseline
         if not test_valid:
             test_rec = config.current_instance_type
         else:

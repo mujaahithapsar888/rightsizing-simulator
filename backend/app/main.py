@@ -60,6 +60,54 @@ app.include_router(feedback.router, prefix=f"{PREFIX}/feedback", tags=["Stakehol
 app.include_router(telemetry.router, prefix=f"{PREFIX}/telemetry", tags=["Telemetry Stream"])
 
 
+# ─── Global Error Boundaries & Exception Handlers ───────────────────────────
+from fastapi import Request, status
+from fastapi.responses import JSONResponse
+from fastapi.exceptions import RequestValidationError
+from starlette.exceptions import HTTPException as StarletteHTTPException
+import logging
+
+logger = logging.getLogger("rightsizing.api")
+
+@app.exception_handler(StarletteHTTPException)
+async def http_exception_handler(request: Request, exc: StarletteHTTPException):
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "error": True,
+            "status_code": exc.status_code,
+            "message": exc.detail,
+            "path": request.url.path,
+        },
+    )
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    return JSONResponse(
+        status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+        content={
+            "error": True,
+            "status_code": 422,
+            "message": "Input validation error in request body or query parameters",
+            "details": exc.errors(),
+            "path": request.url.path,
+        },
+    )
+
+@app.exception_handler(Exception)
+async def generic_exception_handler(request: Request, exc: Exception):
+    logger.error(f"Unhandled exception on {request.method} {request.url.path}: {str(exc)}", exc_info=True)
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "error": True,
+            "status_code": 500,
+            "message": "An unexpected internal server error occurred. The incident has been logged.",
+            "path": request.url.path,
+        },
+    )
+
 @app.get("/health", tags=["Health"])
 async def health_check():
     return {"status": "ok", "version": "1.0.0"}
+
